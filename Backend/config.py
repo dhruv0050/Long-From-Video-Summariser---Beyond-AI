@@ -27,7 +27,14 @@ MAX_FRAMES_PER_VIDEO = 120  # Maximum frames to extract
 AUDIO_SAMPLE_RATE = 16000  # 16kHz for transcription
 
 # API Configuration
-CORS_ORIGINS = ["http://localhost:5173", "http://localhost:3000"]
+# Allow localhost for development, add your production domains here
+CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    # Add production domains here: "https://yourdomain.com"
+]
 
 # Ensure temp directory exists
 os.makedirs(TEMP_DIR, exist_ok=True)
