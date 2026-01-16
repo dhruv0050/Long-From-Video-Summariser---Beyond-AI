@@ -48,7 +48,13 @@ class GeminiService:
         def _transcribe():
             # Upload audio file
             print(f"Uploading audio chunk starting at {start_time}s...")
-            audio_file = genai.upload_file(audio_path)
+            
+            # Use the correct API for google-generativeai >= 0.4.0
+            with open(audio_path, 'rb') as audio_file_obj:
+                audio_file = genai.upload_file(
+                    path=audio_path,
+                    mime_type="audio/wav"
+                )
             
             prompt = """
             Transcribe this audio with speaker diarization. 
