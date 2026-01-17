@@ -34,10 +34,10 @@ class YouTubeService:
             'quiet': True,
             'no_warnings': True,
             'skip_download': True,
-            # Use iOS client for better compatibility
+            # Use tv_embedded client first (works best on servers without cookies)
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios', 'android', 'web']
+                    'player_client': ['tv_embedded', 'ios', 'android', 'web']
                 }
             },
             # Better headers
@@ -46,11 +46,14 @@ class YouTubeService:
             },
         }
         
-        # Add cookies if configured
+        # Add cookies if configured (for get_video_info)
         if config.YOUTUBE_COOKIES_PATH and os.path.exists(config.YOUTUBE_COOKIES_PATH):
             ydl_opts['cookies'] = config.YOUTUBE_COOKIES_PATH
         elif config.YOUTUBE_COOKIES_FROM_BROWSER:
-            ydl_opts['cookies_from_browser'] = (config.YOUTUBE_COOKIES_FROM_BROWSER,)
+            try:
+                ydl_opts['cookies_from_browser'] = (config.YOUTUBE_COOKIES_FROM_BROWSER,)
+            except:
+                pass  # Will fall back to tv_embedded client
         
         url = f"https://www.youtube.com/watch?v={video_id}"
         
@@ -116,11 +119,11 @@ class YouTubeService:
             'progress_hooks': [YouTubeService._progress_hook],
             'no_check_certificate': False,
             'prefer_insecure': False,
-            # Use iOS client which often bypasses bot detection better
+            # Client selection will be updated based on cookie availability
             'extractor_args': {
                 'youtube': {
                     'skip': ['hls'],  # Try to skip HLS if possible
-                    'player_client': ['ios', 'android', 'web']  # Try iOS first (best for avoiding bot detection)
+                    'player_client': ['tv_embedded', 'ios', 'android', 'web']  # tv_embedded works best on servers
                 }
             },
             # Better headers to mimic real browser
@@ -135,13 +138,27 @@ class YouTubeService:
             'retries': 3,
         }
         
-        # Add cookies if configured
+        # Add cookies if configured (prioritize cookies file for server environments)
+        # Note: cookies_from_browser won't work on servers like Render (no browser installed)
+        cookies_configured = False
         if config.YOUTUBE_COOKIES_PATH and os.path.exists(config.YOUTUBE_COOKIES_PATH):
             ydl_opts['cookies'] = config.YOUTUBE_COOKIES_PATH
             print(f"Using cookies from file: {config.YOUTUBE_COOKIES_PATH}")
+            cookies_configured = True
         elif config.YOUTUBE_COOKIES_FROM_BROWSER:
-            ydl_opts['cookies_from_browser'] = (config.YOUTUBE_COOKIES_FROM_BROWSER,)
-            print(f"Using cookies from browser: {config.YOUTUBE_COOKIES_FROM_BROWSER}")
+            # Try cookies_from_browser, but it may fail on servers
+            try:
+                ydl_opts['cookies_from_browser'] = (config.YOUTUBE_COOKIES_FROM_BROWSER,)
+                print(f"Attempting to use cookies from browser: {config.YOUTUBE_COOKIES_FROM_BROWSER}")
+                cookies_configured = True
+            except Exception as e:
+                print(f"Warning: cookies_from_browser not available: {e}")
+                print("Note: On servers (like Render), use YOUTUBE_COOKIES_PATH with a cookies.txt file instead")
+        
+        # If no cookies configured, try tv_embedded client which sometimes bypasses bot detection
+        if not cookies_configured:
+            ydl_opts['extractor_args']['youtube']['player_client'] = ['tv_embedded', 'ios', 'android', 'web']
+            print("No cookies configured - using tv_embedded client (best for server environments)")
         
         # If the URL is just a video ID, construct full URL
         if not youtube_url.startswith('http'):
