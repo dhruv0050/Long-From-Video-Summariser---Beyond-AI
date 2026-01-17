@@ -141,10 +141,26 @@ class YouTubeService:
         # Add cookies if configured (prioritize cookies file for server environments)
         # Note: cookies_from_browser won't work on servers like Render (no browser installed)
         cookies_configured = False
-        if config.YOUTUBE_COOKIES_PATH and os.path.exists(config.YOUTUBE_COOKIES_PATH):
-            ydl_opts['cookies'] = config.YOUTUBE_COOKIES_PATH
-            print(f"Using cookies from file: {config.YOUTUBE_COOKIES_PATH}")
-            cookies_configured = True
+        if config.YOUTUBE_COOKIES_PATH:
+            # Resolve path - handle both relative and absolute paths
+            cookies_path = config.YOUTUBE_COOKIES_PATH
+            if not os.path.isabs(cookies_path):
+                # If relative, try resolving from current directory and from script directory
+                if os.path.exists(cookies_path):
+                    cookies_path = os.path.abspath(cookies_path)
+                else:
+                    # Try relative to Backend directory (where main.py is)
+                    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    potential_path = os.path.join(script_dir, cookies_path)
+                    if os.path.exists(potential_path):
+                        cookies_path = potential_path
+            
+            if os.path.exists(cookies_path):
+                ydl_opts['cookies'] = cookies_path
+                print(f"Using cookies from file: {cookies_path}")
+                cookies_configured = True
+            else:
+                print(f"Warning: Cookies file not found at: {config.YOUTUBE_COOKIES_PATH} (resolved: {cookies_path})")
         elif config.YOUTUBE_COOKIES_FROM_BROWSER:
             # Try cookies_from_browser, but it may fail on servers
             try:
