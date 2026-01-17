@@ -7,6 +7,7 @@ from bson import ObjectId
 from models.database import db
 from models.video_job import VideoJob, TranscriptSegment, Topic, Frame
 from services.drive_service import drive_service
+from services.youtube_service import youtube_service
 from services.gemini_service import gemini_service
 from utils.ffmpeg_utils import FFmpegUtils
 import config
@@ -35,14 +36,22 @@ class ProcessingPipeline:
             # Get job from database
             job = await self._get_job(job_id)
             
+            # Determine video source
+            video_source = job.get("video_source", "drive")
+            if not video_source and job.get("youtube_url"):
+                video_source = "youtube"
+            elif not video_source and job.get("drive_video_url"):
+                video_source = "drive"
+            
             # Update status
             await self._update_job(job_id, {
                 "status": "downloading",
-                "progress": 0.05
+                "progress": 0.05,
+                "video_source": video_source
             })
             
-            # Step 1: Download video
-            video_path = await self._download_video(job)
+            # Step 1: Download video based on source
+            video_path = await self._download_video(job, video_source)
             await self._update_job(job_id, {"progress": 0.1})
             
             # Get video metadata
@@ -73,7 +82,23 @@ class ProcessingPipeline:
                 "status": "analyzing",
                 "progress": 0.55
             })
+            
+            # Build transcript with timestamp context for better analysis
+            transcript_segments_with_time = []
+            for seg in transcript:
+                start_ts = self.ffmpeg.format_timestamp(seg.start_time)
+                end_ts = self.ffmpeg.format_timestamp(seg.end_time)
+                transcript_segments_with_time.append(f"[{start_ts}-{end_ts}] {seg.text}")
+            
             transcript_text = " ".join([seg.text for seg in transcript])
+            
+            # Log transcript coverage for debugging
+            if transcript:
+                first_seg_time = transcript[0].start_time
+                last_seg_time = max(seg.end_time for seg in transcript)
+                print(f"Transcript covers: {self.ffmpeg.format_timestamp(first_seg_time)} to {self.ffmpeg.format_timestamp(last_seg_time)} (video duration: {self.ffmpeg.format_timestamp(duration)})")
+                print(f"Total transcript segments: {len(transcript)}, Total characters: {len(transcript_text)}")
+            
             transcript_analysis = await gemini_service.analyze_transcript(
                 transcript_text, 
                 duration
@@ -140,23 +165,59 @@ class ProcessingPipeline:
                 "error_message": str(e)
             })
     
-    async def _download_video(self, job: Dict) -> str:
-        """Download video from Google Drive"""
-        file_id = drive_service.extract_file_id(job["drive_video_url"])
-        
-        # Get file metadata
-        metadata = drive_service.get_file_metadata(file_id)
-        video_name = metadata.get("name", f"video_{job['_id']}.mp4")
-        
-        # Update job with file info
-        await self._update_job(str(job["_id"]), {
-            "drive_file_id": file_id,
-            "video_name": video_name
-        })
-        
-        # Download to temp directory
+    async def _download_video(self, job: Dict, video_source: str = "drive") -> str:
+        """Download video from Google Drive or YouTube"""
         video_path = os.path.join(config.TEMP_DIR, f"{job['_id']}_video.mp4")
-        drive_service.download_file(file_id, video_path)
+        
+        if video_source == "youtube" or job.get("youtube_url"):
+            # Download from YouTube
+            youtube_url = job.get("youtube_url")
+            if not youtube_url:
+                raise Exception("YouTube URL not found in job")
+            
+            video_id = youtube_service.extract_video_id(youtube_url)
+            
+            # Get video metadata
+            try:
+                video_info = youtube_service.get_video_info(video_id)
+                video_name = video_info.get("title", f"video_{job['_id']}.mp4")
+                duration = video_info.get("duration", 0)
+            except Exception as e:
+                print(f"Warning: Could not fetch YouTube metadata: {e}")
+                video_name = job.get("video_name") or f"video_{job['_id']}.mp4"
+                duration = None
+            
+            # Update job with video info
+            await self._update_job(str(job["_id"]), {
+                "youtube_video_id": video_id,
+                "video_name": video_name,
+                "video_source": "youtube"
+            })
+            
+            # Download video
+            youtube_service.download_video(youtube_url, video_path, video_id)
+            
+        else:
+            # Download from Google Drive (existing logic)
+            drive_url = job.get("drive_video_url")
+            if not drive_url:
+                raise Exception("Drive video URL not found in job")
+            
+            file_id = drive_service.extract_file_id(drive_url)
+            
+            # Get file metadata
+            metadata = drive_service.get_file_metadata(file_id)
+            video_name = metadata.get("name", f"video_{job['_id']}.mp4")
+            
+            # Update job with file info
+            await self._update_job(str(job["_id"]), {
+                "drive_file_id": file_id,
+                "video_name": video_name,
+                "video_source": "drive"
+            })
+            
+            # Download to temp directory
+            drive_service.download_file(file_id, video_path)
         
         return video_path
     
@@ -208,8 +269,37 @@ class ProcessingPipeline:
         for seg in sorted_segments[1:]:
             last_seg = deduplicated[-1]
             
-            # If this segment overlaps significantly with the last one, skip it
-            if seg.start_time < last_seg.end_time - 5:  # 5 second threshold
+            # If this segment overlaps significantly (>70% overlap), merge or skip
+            overlap_start = max(seg.start_time, last_seg.start_time)
+            overlap_end = min(seg.end_time, last_seg.end_time)
+            overlap_duration = max(0, overlap_end - overlap_start)
+            
+            last_duration = last_seg.end_time - last_seg.start_time
+            seg_duration = seg.end_time - seg.start_time
+            
+            # If high overlap (>70% of either segment), prefer the one with more text or merge them
+            if last_duration > 0 and overlap_duration / last_duration > 0.7:
+                # Merge: keep the longer segment or the one with more text
+                if len(seg.text) > len(last_seg.text) or seg_duration > last_duration:
+                    deduplicated[-1] = seg
+                continue
+            elif seg_duration > 0 and overlap_duration / seg_duration > 0.7:
+                # Same check from other direction
+                if len(seg.text) > len(last_seg.text) or seg_duration > last_duration:
+                    deduplicated[-1] = seg
+                continue
+            
+            # If segments are very close (< 2 seconds gap), merge them
+            gap = seg.start_time - last_seg.end_time
+            if gap < 2 and gap > -2:  # Very close segments, merge
+                # Merge text and extend end time
+                merged_text = last_seg.text + " " + seg.text
+                deduplicated[-1] = TranscriptSegment(
+                    text=merged_text,
+                    start_time=last_seg.start_time,
+                    end_time=max(last_seg.end_time, seg.end_time),
+                    speaker=last_seg.speaker or seg.speaker
+                )
                 continue
             
             deduplicated.append(seg)

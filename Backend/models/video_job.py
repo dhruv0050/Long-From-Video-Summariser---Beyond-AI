@@ -54,10 +54,18 @@ class VideoJobCreate(BaseModel):
     video_name: Optional[str] = None
 
 
+class YouTubeJobCreate(BaseModel):
+    youtube_url: str
+    video_name: Optional[str] = None
+
+
 class VideoJob(BaseModel):
     id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
-    drive_video_url: str
+    drive_video_url: Optional[str] = None  # For Google Drive videos
+    youtube_url: Optional[str] = None  # For YouTube videos
+    video_source: str = "drive"  # "drive" or "youtube"
     drive_file_id: Optional[str] = None
+    youtube_video_id: Optional[str] = None  # YouTube video ID
     video_name: Optional[str] = None
     status: str = "pending"  # pending, downloading, processing, completed, failed
     progress: float = 0.0

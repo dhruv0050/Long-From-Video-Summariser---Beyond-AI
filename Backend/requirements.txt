@@ -21,6 +21,7 @@ opencv-python==4.9.0.80
 scenedetect[opencv]==0.6.3
 Pillow==11.0.0
 imageio-ffmpeg==0.4.9
+yt-dlp==2024.12.13
 
 # Audio processing
 pydub==0.25.1

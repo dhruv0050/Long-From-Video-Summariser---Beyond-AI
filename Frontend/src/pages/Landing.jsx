@@ -6,7 +6,7 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const Landing = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const [driveUrl, setDriveUrl] = useState('');
+  const [videoUrl, setVideoUrl] = useState('');
   const [videoName, setVideoName] = useState('');
   const [jobId, setJobId] = useState('');
   const [status, setStatus] = useState('idle');
@@ -15,8 +15,20 @@ const Landing = () => {
   const [error, setError] = useState('');
   const [polling, setPolling] = useState(false);
   const [viewingPastReport, setViewingPastReport] = useState(false);
+  const [videoSource, setVideoSource] = useState('auto'); // 'auto', 'drive', 'youtube'
 
-  const canSubmit = useMemo(() => driveUrl.trim().length > 0, [driveUrl]);
+  // Detect video source from URL
+  const detectVideoSource = (url) => {
+    if (!url) return 'auto';
+    const youtubePattern = /(?:youtube\.com|youtu\.be)/;
+    const drivePattern = /drive\.google\.com/;
+    
+    if (youtubePattern.test(url)) return 'youtube';
+    if (drivePattern.test(url)) return 'drive';
+    return 'auto';
+  };
+
+  const canSubmit = useMemo(() => videoUrl.trim().length > 0, [videoUrl]);
 
   // Check if we're viewing a past report from URL params
   useEffect(() => {
@@ -47,14 +59,38 @@ const Landing = () => {
     setProgress(0);
     setJobId('');
 
+    const url = videoUrl.trim();
+    const detectedSource = detectVideoSource(url);
+    const source = videoSource === 'auto' ? detectedSource : videoSource;
+
+    // Validate URL based on source
+    if (source === 'auto' || (!detectedSource.includes('youtube') && !detectedSource.includes('drive'))) {
+      setError('Please enter a valid Google Drive or YouTube URL');
+      setStatus('idle');
+      return;
+    }
+
     try {
-      const resp = await fetch(`${API_BASE}/api/videos/process`, {
+      let endpoint, payload;
+      
+      if (source === 'youtube') {
+        endpoint = `${API_BASE}/api/videos/process-youtube`;
+        payload = {
+          youtube_url: url,
+          video_name: videoName.trim() || 'Untitled Video',
+        };
+      } else {
+        endpoint = `${API_BASE}/api/videos/process`;
+        payload = {
+          drive_video_url: url,
+          video_name: videoName.trim() || 'Untitled Video',
+        };
+      }
+
+      const resp = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          drive_video_url: driveUrl.trim(),
-          video_name: videoName.trim() || 'Untitled Video',
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!resp.ok) {
@@ -153,22 +189,22 @@ const Landing = () => {
     <div className="page">
       <header className="hero">
         <div>
-          <p className="eyebrow">Gemini + Google Drive</p>
+          <p className="eyebrow">Gemini + Google Drive & YouTube</p>
           <h1>Video Summarizer</h1>
           <p className="muted">
-            Paste a Google Drive video link, kick off processing, and see transcript + key frames + insights.
+            Paste a Google Drive or YouTube video link, kick off processing, and see transcript + key frames + insights.
           </p>
         </div>
         <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
           {viewingPastReport && (
             <button
               onClick={() => {
-                setViewingPastReport(false);
-                setJobId('');
-                setResult(null);
-                setDriveUrl('');
-                setVideoName('');
-                navigate('/');
+              setViewingPastReport(false);
+              setJobId('');
+              setResult(null);
+              setVideoUrl('');
+              setVideoName('');
+              navigate('/');
               }}
               style={{
                 padding: '10px 20px',
@@ -223,24 +259,56 @@ const Landing = () => {
       {!viewingPastReport && (
       <form className="card form" onSubmit={handleSubmit}>
         <div className="field">
-          <label>Google Drive Video URL</label>
+          <label>Video URL (Google Drive or YouTube)</label>
           <input
             type="url"
-            placeholder="https://drive.google.com/file/d/FILE_ID/view"
-            value={driveUrl}
-            onChange={(e) => setDriveUrl(e.target.value)}
+            placeholder="https://drive.google.com/file/d/FILE_ID/view or https://youtube.com/watch?v=VIDEO_ID"
+            value={videoUrl}
+            onChange={(e) => {
+              setVideoUrl(e.target.value);
+              const detected = detectVideoSource(e.target.value);
+              if (detected !== 'auto' && videoSource === 'auto') {
+                setVideoSource(detected);
+              }
+            }}
             required
           />
+          <div style={{ marginTop: '8px', fontSize: '12px', color: '#9ca3af' }}>
+            {videoUrl && detectVideoSource(videoUrl) === 'youtube' && '✓ YouTube URL detected'}
+            {videoUrl && detectVideoSource(videoUrl) === 'drive' && '✓ Google Drive URL detected'}
+            {videoUrl && detectVideoSource(videoUrl) === 'auto' && '⚠️ Please enter a valid Drive or YouTube URL'}
+          </div>
         </div>
 
         <div className="field">
           <label>Video Name (optional)</label>
           <input
             type="text"
-            placeholder="My Seminar"
+            placeholder="My Seminar / Lecture"
             value={videoName}
             onChange={(e) => setVideoName(e.target.value)}
           />
+        </div>
+
+        <div className="field">
+          <label>Video Source (auto-detected from URL)</label>
+          <select
+            value={videoSource}
+            onChange={(e) => setVideoSource(e.target.value)}
+            style={{
+              padding: '12px',
+              backgroundColor: 'rgba(255,255,255,0.05)',
+              color: 'white',
+              border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: '8px',
+              fontSize: '14px',
+              width: '100%'
+            }}
+          >
+            <option value="auto">Auto-detect</option>
+            <option value="drive">Google Drive</option>
+            <option value="youtube">YouTube</option>
+          </select>
         </div>
 
         <div className="actions">

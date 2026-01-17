@@ -5,7 +5,8 @@ from typing import List
 
 from models.database import db
 from models.video_job import (
-    VideoJobCreate, 
+    VideoJobCreate,
+    YouTubeJobCreate,
     VideoJobResponse, 
     VideoJobResult,
     VideoJob,
@@ -59,6 +60,52 @@ async def process_video(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
+
+
+@router.post("/process-youtube", response_model=VideoJobResponse)
+async def process_youtube_video(
+    job_request: YouTubeJobCreate,
+    background_tasks: BackgroundTasks
+):
+    """
+    Start processing a video from YouTube
+    
+    Args:
+        job_request: YouTube job request with YouTube URL
+        background_tasks: FastAPI background tasks
+    
+    Returns:
+        Job response with job_id and initial status
+    """
+    try:
+        # Create job in database
+        database = db.get_db()
+        
+        job = VideoJob(
+            youtube_url=job_request.youtube_url,
+            video_name=job_request.video_name,
+            video_source="youtube",
+            status="pending",
+            progress=0.0
+        )
+        
+        # Insert into MongoDB
+        result = await database.video_jobs.insert_one(job.dict(by_alias=True))
+        job_id = str(result.inserted_id)
+        
+        # Start processing in background
+        background_tasks.add_task(pipeline.process_video, job_id)
+        
+        return VideoJobResponse(
+            job_id=job_id,
+            status="pending",
+            progress=0.0,
+            video_name=job_request.video_name,
+            created_at=datetime.utcnow()
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create YouTube job: {str(e)}")
 
 
 @router.get("/status/{job_id}", response_model=VideoJobResponse)

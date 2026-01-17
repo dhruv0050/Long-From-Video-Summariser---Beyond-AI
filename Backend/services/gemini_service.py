@@ -163,7 +163,7 @@ class GeminiService:
         Returns:
             Dictionary with topics, key moments, entities
         """
-        # If transcript is very large (>30 min video), analyze in chunks
+        # If transcript is very large, analyze in chunks but always provide full duration context
         max_chars = 50000  # ~12k tokens
         
         if len(transcript_text) > max_chars:
@@ -176,47 +176,120 @@ class GeminiService:
                 for i in range(0, len(words), chunk_size)
             ]
             
-            # Analyze each chunk
+            # Analyze each chunk but provide full duration context
             all_topics = []
             all_entities = {"people": [], "companies": [], "concepts": [], "tools": []}
             all_takeaways = []
+            all_visual_cues = []
             
             for idx, chunk in enumerate(chunks):
-                print(f"Analyzing chunk {idx+1}/{len(chunks)}...")
-                result = await self._analyze_transcript_chunk(chunk, duration, idx, len(chunks))
+                print(f"Analyzing chunk {idx+1}/{len(chunks)} (full duration: {duration/60:.1f} min)...")
+                # Calculate approximate time range for this chunk (for reference)
+                chunk_start_approx = (idx / len(chunks)) * duration
+                chunk_end_approx = ((idx + 1) / len(chunks)) * duration
+                
+                result = await self._analyze_transcript_chunk(
+                    chunk, 
+                    duration, 
+                    idx, 
+                    len(chunks),
+                    chunk_start_approx,
+                    chunk_end_approx
+                )
                 if result:
-                    all_topics.extend(result.get("topics", []))
+                    # Always provide full duration context, so each chunk should generate topics for full video
+                    # But we'll merge and deduplicate
+                    chunk_topics = result.get("topics", [])
+                    all_topics.extend(chunk_topics)
                     # Merge entities
                     for key in all_entities:
                         all_entities[key].extend(result.get("entities", {}).get(key, []))
                     all_takeaways.extend(result.get("key_takeaways", []))
+                    all_visual_cues.extend(result.get("visual_cues", []))
             
             # Deduplicate entities
             for key in all_entities:
                 all_entities[key] = list(set(all_entities[key]))
             
+            # Deduplicate topics by timestamp range (merge overlapping/duplicate topics)
+            deduplicated_topics = self._deduplicate_topics(all_topics, duration)
+            
             return {
-                "topics": all_topics,
+                "topics": deduplicated_topics,
                 "entities": all_entities,
-                "key_takeaways": list(set(all_takeaways))
+                "key_takeaways": list(set(all_takeaways)),
+                "visual_cues": all_visual_cues
             }
         else:
-            return await self._analyze_transcript_chunk(transcript_text, duration, 0, 1)
+            return await self._analyze_transcript_chunk(transcript_text, duration, 0, 1, 0.0, duration)
+    
+    def _deduplicate_topics(self, topics: List[Dict], duration: float) -> List[Dict]:
+        """Deduplicate and merge overlapping topics"""
+        if not topics:
+            return []
+        
+        # Sort topics by start time
+        sorted_topics = sorted(topics, key=lambda t: timestamp_to_seconds(t.get("timestamp_range", ["00:00:00"])[0]))
+        
+        deduplicated = []
+        for topic in sorted_topics:
+            ts_range = topic.get("timestamp_range", [])
+            if len(ts_range) < 2:
+                continue
+            
+            start_ts = timestamp_to_seconds(ts_range[0])
+            end_ts = timestamp_to_seconds(ts_range[1])
+            
+            # Skip if this topic overlaps significantly with the last one (>70% overlap)
+            if deduplicated:
+                last_topic = deduplicated[-1]
+                last_start = timestamp_to_seconds(last_topic.get("timestamp_range", [])[0])
+                last_end = timestamp_to_seconds(last_topic.get("timestamp_range", [])[1])
+                
+                overlap_start = max(start_ts, last_start)
+                overlap_end = min(end_ts, last_end)
+                overlap_duration = max(0, overlap_end - overlap_start)
+                last_duration = last_end - last_start
+                
+                if last_duration > 0 and overlap_duration / last_duration > 0.7:
+                    # Merge topics by keeping the longer one or the one with more key points
+                    if len(topic.get("key_points", [])) > len(last_topic.get("key_points", [])):
+                        deduplicated[-1] = topic
+                    continue
+            
+            deduplicated.append(topic)
+        
+        return deduplicated
     
     async def _analyze_transcript_chunk(
         self,
         transcript_text: str,
         duration: float,
         chunk_idx: int,
-        total_chunks: int
+        total_chunks: int,
+        chunk_start_time: float = None,
+        chunk_end_time: float = None
     ) -> Dict[str, Any]:
         """Analyze a single transcript chunk"""
         def _analyze():
             chunk_info = f" (part {chunk_idx+1}/{total_chunks})" if total_chunks > 1 else ""
+            time_info = ""
+            if chunk_start_time is not None and chunk_end_time is not None:
+                start_ts = seconds_to_timestamp(chunk_start_time)
+                end_ts = seconds_to_timestamp(chunk_end_time)
+                time_info = f"\n\nIMPORTANT: This transcript chunk covers video time {start_ts} to {end_ts} out of total duration {seconds_to_timestamp(duration)}."
+            
             prompt = f"""
-        Analyze this video transcript{chunk_info} (total duration: {duration/60:.1f} minutes) and extract:
+        Analyze this video transcript{chunk_info} (total video duration: {duration/60:.1f} minutes = {seconds_to_timestamp(duration)}) and extract topics that span the ENTIRE video duration.
         
-        1. Topic segmentation: Break into logical chapters with start/end timestamps
+        CRITICAL: You must analyze the transcript and generate topics with timestamps that cover the FULL video duration from 00:00:00 to {seconds_to_timestamp(duration)}. Do not stop at just the beginning or middle - ensure topics are distributed throughout the entire video.{time_info}
+        
+        Extract the following:
+        
+        1. Topic segmentation: Break the video into logical chapters/sections with start/end timestamps covering the ENTIRE duration (00:00:00 to {seconds_to_timestamp(duration)})
+           - Each topic should have clear start and end timestamps
+           - Topics should progress chronologically through the video
+           - Ensure topics cover from the start to the end of the video
         2. Key moments: Important phrases that likely reference visuals ("as shown", "this slide", etc.)
         3. Named entities: People, companies, tools, concepts mentioned
         4. Key takeaways: Main insights from the content
@@ -224,7 +297,7 @@ class GeminiService:
         Transcript:
         {transcript_text}
         
-        Return analysis in this JSON format:
+        Return analysis in this JSON format (ensure topics cover the full video duration):
         {{
             "topics": [
                 {{
@@ -249,9 +322,11 @@ class GeminiService:
             }},
             "key_takeaways": ["takeaway 1", "takeaway 2"]
         }}
+        
+        Remember: Generate topics that span from 00:00:00 to {seconds_to_timestamp(duration)} to cover the entire video.
         """
             
-            print("Analyzing transcript with Gemini...")
+            print(f"Analyzing transcript chunk {chunk_idx+1}/{total_chunks} with Gemini...")
             response = self.text_model.generate_content(prompt)
             result = self._parse_json_response(response.text)
             return result or {}
@@ -389,33 +464,44 @@ class GeminiService:
             Structured output with topics, summary, etc.
         """
         def _synthesize():
-            # Create a compact version for synthesis
-            topics_preview = json.dumps(transcript_analysis.get("topics", [])[:5])[:2000]
-            frames_preview = json.dumps(frame_analyses[:10])[:2000]
+            # Get all topics from transcript analysis - preserve ALL of them
+            all_topics = transcript_analysis.get("topics", [])
+            
+            # Ensure topics cover full duration - if not, keep original topics from analysis
+            topics_covering_full_duration = all_topics
+            
+            # Create a compact version for synthesis summary generation
+            topics_preview = json.dumps(all_topics[:10])[:3000] if len(all_topics) > 10 else json.dumps(all_topics)[:3000]
+            frames_preview = json.dumps(frame_analyses[:15])[:3000] if len(frame_analyses) > 15 else json.dumps(frame_analyses)[:3000]
             
             prompt = f"""
-        You are synthesizing analysis of a {duration/60:.1f}-minute video.
+        You are synthesizing analysis of a {duration/60:.1f}-minute video (duration: {seconds_to_timestamp(duration)}).
         
-        Transcript Topics (excerpt):
+        IMPORTANT: You must preserve ALL topics from the transcript analysis. Do not filter, remove, or skip any topics. 
+        All topics should cover the full video duration from 00:00:00 to {seconds_to_timestamp(duration)}.
+        
+        Transcript Topics ({len(all_topics)} total - preserve ALL of them):
         {topics_preview}
         
-        Key Frames (excerpt, {len(frame_analyses)} total):
+        Key Frames ({len(frame_analyses)} total):
         {frames_preview}
         
-        Create a comprehensive synthesis that:
-        1. Generates an executive summary (3-5 sentences)
-        2. Provides topic-wise breakdown
-        3. Extracts actionable insights and key takeaways
-        4. Lists entities mentioned (companies, concepts, tools)
+        Your task:
+        1. Generate an executive summary (3-5 sentences) covering the ENTIRE video
+        2. PRESERVE ALL topics from transcript analysis - do not filter or remove any
+        3. Ensure topics span the full video duration (00:00:00 to {seconds_to_timestamp(duration)})
+        4. Extract actionable insights and key takeaways
+        5. List entities mentioned (companies, concepts, tools)
         
         Return ONLY valid JSON (no trailing commas or newlines in strings):
         {{
-            "executive_summary": "Clear summary...",
+            "executive_summary": "Clear summary covering the entire video...",
             "topics": [
                 {{
                     "title": "Topic title",
                     "timestamp_range": ["00:00:00", "00:15:30"],
-                    "summary": "Single line summary"
+                    "summary": "Single line summary",
+                    "key_points": ["point 1", "point 2"]
                 }}
             ],
             "key_takeaways": ["takeaway 1", "takeaway 2"],
@@ -425,24 +511,35 @@ class GeminiService:
                 "tools": ["tool1"]
             }}
         }}
+        
+        CRITICAL: Include ALL {len(all_topics)} topics in your response. Topics must cover from 00:00:00 to {seconds_to_timestamp(duration)}.
         """
             
-            print("Synthesizing results with Gemini...")
+            print(f"Synthesizing results with Gemini (preserving {len(all_topics)} topics)...")
             response = self.text_model.generate_content(prompt)
             result = self._parse_json_response(response.text)
             
-            return result or {
-                "executive_summary": "Video processing completed but synthesis failed.",
-                "topics": transcript_analysis.get("topics", []),
-                "key_takeaways": transcript_analysis.get("key_takeaways", []),
-                "entities": transcript_analysis.get("entities", {})
+            # If synthesis returns fewer topics than original, prefer original topics
+            synthesized_topics = result.get("topics", []) if result else []
+            if len(synthesized_topics) < len(all_topics) * 0.8:  # If we lost >20% of topics
+                print(f"Warning: Synthesis returned {len(synthesized_topics)} topics but original had {len(all_topics)}. Using original topics.")
+                synthesized_topics = all_topics
+            
+            # Merge: use synthesized topics if they cover full duration, otherwise use original
+            final_topics = synthesized_topics if synthesized_topics else all_topics
+            
+            return {
+                "executive_summary": result.get("executive_summary", "") if result else "Video processing completed.",
+                "topics": final_topics,
+                "key_takeaways": result.get("key_takeaways", transcript_analysis.get("key_takeaways", [])) if result else transcript_analysis.get("key_takeaways", []),
+                "entities": result.get("entities", transcript_analysis.get("entities", {})) if result else transcript_analysis.get("entities", {})
             }
         
         try:
             return retry_with_backoff(_synthesize, max_retries=2)
         except Exception as e:
             print(f"Error synthesizing results: {e}")
-            # Return fallback with raw analysis
+            # Return fallback with ALL original topics from analysis
             return {
                 "executive_summary": "Video processing completed but synthesis had errors.",
                 "topics": transcript_analysis.get("topics", []),
